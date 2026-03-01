@@ -4,6 +4,7 @@ import { simpleParser } from 'mailparser';
 import { extractText, getDocumentProxy } from 'unpdf';
 import * as xlsx from 'xlsx';
 import * as fs from 'fs';
+import * as path from 'path';
 
 
 // --- 配置区域 ---
@@ -17,6 +18,10 @@ let client: ImapFlow;
 let cachedActiveOrders = new Set<string>();
 // 首次启动时读入一次
 cachedActiveOrders = getActiveOrders(EXCEL_PATH);
+// --- 优雅退出机制 ---
+// ⭐ 新增全局状态锁，防止关机时触发重连风暴
+let isShuttingDown = false;
+
 
 // 监听 Excel 文件的修改，一旦修改，立刻在后台静默重载
 fs.watch(EXCEL_PATH, (eventType) => {
@@ -60,11 +65,19 @@ function getActiveOrders(excelFilePath: string = EXCEL_PATH): Set<string> {
             
         const rows = xlsx.utils.sheet_to_json<Record<string, any>>(worksheet, { defval: '' });
 
-        // ✅ 内存优化：将处理函数移出循环体，避免重复分配内存
+        // ✅ 内存优化 + 脏数据多单号粉碎机
         const cleanAndAdd = (val: any) => {
             if (val && typeof val === 'string') {
-                const cleanVal = val.replace(/[\s-]/g, '').toUpperCase();
-                if (cleanVal) activeOrders.add(cleanVal);
+                // 利用正则同时支持劈开：斜杠 /、反斜杠 \、逗号 ,、中文逗号 ，、顿号 、、分号 ; 以及 换行符
+                const parts = val.split(/[/\\[\]\n,;，、]/);
+                
+                for (const part of parts) {
+                    // 对劈开后的每一个子串进行标准的去空、去横杠、转大写操作
+                    const cleanVal = part.replace(/[\s-]/g, '').toUpperCase();
+                    if (cleanVal) {
+                        activeOrders.add(cleanVal);
+                    }
+                }
             } else if (val && typeof val === 'number') {
                 activeOrders.add(val.toString());
             }
@@ -143,6 +156,12 @@ async function processUnseenMessage(): Promise<void> {
 
     // 1. 读取阶段
     for await (let message of client.fetch(unseenUids, { source: true, uid: true })) {
+        // ⭐ 新增：如果已经拉闸，立刻停止处理剩下的邮件！
+        if (isShuttingDown) {
+            console.log('⚠️ 系统正在关闭，中止剩余邮件读取...');
+            break;
+        }
+
         try {
             // ⭐ 新增：如果这个 UID 之前处理过了，直接跳过！
             if (processedUids.has(message.uid)) continue;
@@ -170,8 +189,20 @@ async function processUnseenMessage(): Promise<void> {
                     if (attachment.contentType === 'application/pdf') {
                         console.log(`📎 发现 PDF 附件: [${attachment.filename}]，正在提取文本...`);
                         try {
-                            // unpdf 完美支持将 Node Buffer 作为 Uint8Array 传入
-                            const pdf = await getDocumentProxy(new Uint8Array(attachment.content as Buffer));
+                            // ⭐ 终极魔法：构造本地字体库的绝对路径 (把反斜杠换成正斜杠，防止 Windows 路径在底层被转义)
+                            const localCMapPath = path.join(__dirname, 'node_modules/pdfjs-dist/cmaps/').replace(/\\/g, '/');
+                            const localStandardFontPath = path.join(__dirname, 'node_modules/pdfjs-dist/standard_fonts/').replace(/\\/g, '/');
+                            // 第一个参数：老老实实地只传纯净的二进制数据
+                            // 第二个参数：单独传入 cMaps 配置字典
+                            const pdf = await getDocumentProxy(
+                                new Uint8Array(attachment.content as Buffer),
+                                {
+                                    // 👈 彻底抛弃 CDN，直接从本地硬盘秒读字体包！
+                                    cMapUrl: localCMapPath,
+                                    cMapPacked: true,
+                                    standardFontDataUrl: localStandardFontPath
+                                } as any
+                            );
                             // mergePages: true 会自动把多页 PDF 的纯文本完美拼接在一起
                             const { text } = await extractText(pdf, { mergePages: true });
                             emailContent += `\n--- PDF Content (${attachment.filename}) ---\n${text}`;
@@ -314,6 +345,12 @@ async function connectWithBackoff() {
             await startBot();
 
         } catch (err) {
+            // ⭐ 新增防御：如果已经拉下总电闸，直接跳出死循环，让程序安静死去
+            if (isShuttingDown) {
+                console.log('👋 系统正在安全关闭，终止退避重连机制。');
+                return;
+            }
+            
             console.error('\n💥 [异常] 运行中断或连接失败:', (err as Error).message);
             
             // 安全清理：不管实例死没死透，强制登出并释放内存
@@ -338,7 +375,17 @@ async function connectWithBackoff() {
 
 // 拦截 Ctrl+C 的代码稍微调整一下，确保能退出这个死循环
 process.on('SIGINT', async () => {
+    if (isShuttingDown) return; // 防止狂按 Ctrl+C
+    isShuttingDown = true;      // 拉下总电闸！
+
     console.log('\n🛑 接收到退出信号，正在安全清理...');
+
+    // ⭐ 新增：3秒倒计时！不管底层在干什么，3秒后绝对强制杀死进程
+    setTimeout(() => {
+        console.log('⏳ 清理超时，强制终止进程。');
+        process.exit(0);
+    }, 3000);
+
     if (client && client.usable) {
         try { await client.logout(); } catch (e) {}
     }
