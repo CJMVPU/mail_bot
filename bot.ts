@@ -5,10 +5,11 @@ import { extractText, getDocumentProxy } from 'unpdf';
 import * as xlsx from 'xlsx';
 import * as fs from 'fs';
 import * as path from 'path';
+import { pathToFileURL } from 'url'; // 👈 新增这行
 
 
-// --- 配置区域 ---
-const EXCEL_PATH = 'C:/Users/cheng/Documents/Typescript_Projects/mail_bot/台账.xlsx'; // ✅ 补上缺失的路径
+// ⭐ 无论在 Windows 还是 Linux，它都会自动找到和 bot.ts 同目录下的 台账.xlsx
+const EXCEL_PATH = path.resolve(__dirname, './台账.xlsx');
 // 用于记录本次运行期间已经处理过的邮件 UID，防止重复分析
 const MAX_UID_CACHE_SIZE = 3000;
 const processedUids = new Set<number>();
@@ -182,6 +183,7 @@ async function processUnseenMessage(): Promise<void> {
             let emailContent = `${subject}\n${parsed.text || ''}`;
 
             console.log(`\n正在分析: "${subject}"`);
+            
             // ⭐ 新增：PDF 附件“透视”逻辑 ⭐
             if (parsed.attachments && parsed.attachments.length > 0) {
                 for (const attachment of parsed.attachments) {
@@ -189,20 +191,28 @@ async function processUnseenMessage(): Promise<void> {
                     if (attachment.contentType === 'application/pdf') {
                         console.log(`📎 发现 PDF 附件: [${attachment.filename}]，正在提取文本...`);
                         try {
-                            // ⭐ 终极魔法：构造本地字体库的绝对路径 (把反斜杠换成正斜杠，防止 Windows 路径在底层被转义)
-                            const localCMapPath = path.join(__dirname, 'node_modules/pdfjs-dist/cmaps/').replace(/\\/g, '/');
-                            const localStandardFontPath = path.join(__dirname, 'node_modules/pdfjs-dist/standard_fonts/').replace(/\\/g, '/');
-                            // 第一个参数：老老实实地只传纯净的二进制数据
-                            // 第二个参数：单独传入 cMaps 配置字典
+                            // 1. 获取 Linux 的绝对路径
+                            const cMapDir = path.join(__dirname, 'node_modules/pdfjs-dist/cmaps/');
+                            const fontDir = path.join(__dirname, 'node_modules/pdfjs-dist/standard_fonts/');
+
+                            // ⭐ 2. 终极魔法：将绝对路径转换为标准的 file:// URL 协议，并在末尾强制加上斜杠！
+                            const cMapUrl = pathToFileURL(cMapDir).href + '/';
+                            const standardFontDataUrl = pathToFileURL(fontDir).href + '/';
+
                             const pdf = await getDocumentProxy(
                                 new Uint8Array(attachment.content as Buffer),
                                 {
-                                    // 👈 彻底抛弃 CDN，直接从本地硬盘秒读字体包！
-                                    cMapUrl: localCMapPath,
-                                    cMapPacked: true,
-                                    standardFontDataUrl: localStandardFontPath
+                                    // 👈 终极静音：我们不要外挂字体包了，直接让它用内置的纯文本映射引擎！
+                                    // cMapUrl: cMapUrl,
+                                    // cMapPacked: true,
+                                    // standardFontDataUrl: standardFontDataUrl,
+                                    
+                                    // 强制关闭渲染过程中的所有图形/字体缺失警告
+                                    verbosity: 0,
+                                    useSystemFonts: true 
                                 } as any
                             );
+                            
                             // mergePages: true 会自动把多页 PDF 的纯文本完美拼接在一起
                             const { text } = await extractText(pdf, { mergePages: true });
                             emailContent += `\n--- PDF Content (${attachment.filename}) ---\n${text}`;
@@ -288,16 +298,19 @@ async function startBot() {
             client.once('close', () => reject(new Error('IMAP connection closed unexpectedly')));
             client.once('error', (err: Error) => reject(err));
         });
-
     } catch (error) {
         // 如果上面 Promise 抛出了断网异常，会被这里捕获，然后再扔给外层的重连引擎
         console.error("BOT runtime error / disconnected:", (error as Error).message);
         throw error; 
     } finally {
-        // 只有当真的断网、准备重连时，才会走到这里，优雅释放掉旧的锁
-        if (lock) {
-            lock.release();
-            console.log("INBOX lock released.");
+        // ⭐ 修复：只有当客户端还活着，并且可用时，才去释放锁！
+        if (lock && client && client.usable) {
+            try { 
+                lock.release(); 
+                console.log("INBOX lock released.");
+            } catch (e) {
+                // 静默忽略释放锁时可能产生的残余报错
+            }
         }
     }
 }
@@ -394,3 +407,4 @@ process.on('SIGINT', async () => {
 
 // 引擎点火！
 connectWithBackoff();
+

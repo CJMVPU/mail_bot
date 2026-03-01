@@ -2,15 +2,16 @@ import 'dotenv/config';
 import { GoogleGenerativeAI, SchemaType, Tool } from '@google/generative-ai';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-// 👇 新增：引入底层网络调度器
-import { setGlobalDispatcher, ProxyAgent } from 'undici';
 
-// 👇 新增：强行将所有 fetch 流量引流到你的本地代理端口
-// 请确保 10808 是你当前代理软件的真实 HTTP 端口
-const proxyUrl = process.env.HTTPS_PROXY || 'http://127.0.0.1:33564';
-const dispatcher = new ProxyAgent(proxyUrl);
-setGlobalDispatcher(dispatcher);
-console.log(`🌐 [系统] 已启用本地网络代理: ${proxyUrl}`);
+
+// 🌟 1. 智能环境嗅探：如果不是生产环境，强行启用本地代理接管
+import { setGlobalDispatcher, ProxyAgent } from 'undici';
+if (process.env.NODE_ENV !== 'production') {
+    // 本地开发时，走你的 Windows 镜像翻墙隧道，绝不丢包！
+    const dispatcher = new ProxyAgent('http://127.0.0.1:33564');
+    setGlobalDispatcher(dispatcher);
+    console.log(`🌐 [系统-开发模式] 已强行接管 Node 底层网络，走本地代理: 33564`);
+}
 
 // 把回调形式的 exec 包装成 Promise，方便我们用 async/await 优雅调用
 const execAsync = promisify(exec);
@@ -86,11 +87,16 @@ async function runAgent(userPrompt: string) {
     console.log(`🤖 AI 正在思考如何调度...`);
 
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY as string);
-    // 推荐使用 flash 模型做函数调用，速度极快
-    const model = genAI.getGenerativeModel({ 
-        model: "gemini-3-flash-preview",
-        tools: toolsConfig 
-    });
+    // 🌟 2. 动态路由基地址
+    // 本地开发不配 baseUrl（默认走代理连官方），线上生产环境才会使用你的免翻墙域名
+    const baseUrl = process.env.NODE_ENV === 'production' 
+        ? "https://edgerouting.uk" 
+        : undefined;
+        
+    const model = genAI.getGenerativeModel(
+        { model: "gemini-3-flash-preview", tools: toolsConfig },
+        baseUrl ? { baseUrl } : undefined 
+    );
 
     const chat = model.startChat();
     const result = await chat.sendMessage(userPrompt);
